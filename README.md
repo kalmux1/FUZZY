@@ -1,7 +1,7 @@
 # FUZZY
 
-> Multi-domain subdomain reconnaissance — puredns × ffuf.
-> Author: **Kalmux** · License: MIT
+> Multi-domain subdomain reconnaissance - puredns x ffuf.
+> Author: **Kalmux** - License: MIT
 
 Feed a domain list and a wordlist; get every discovered subdomain in one
 file, with HTTP status/length/title where the host answers.
@@ -11,21 +11,23 @@ file, with HTTP status/length/title where the host answers.
 ```bash
 git clone https://github.com/kalmux/fuzzy.git
 cd fuzzy
+chmod +x install.sh fuzzy.py
 ./install.sh
 exec $SHELL
 ```
 
 `install.sh` installs:
 
-- **ffuf** — HTTP fuzzing / host probing
-- **puredns** — mass DNS brute-force with wildcard filtering
-- **massdns** — DNS resolver engine used by puredns
-- **resolvers list** — public resolvers at `~/.config/fuzzy/resolvers.txt`
-- **`fuzzy` command** — symlinked at `~/.local/bin/fuzzy`
-- **shell alias** — `alias fuzzy="~/.local/share/fuzzy/fuzzy.py"`
+- **python3** (required runtime)
+- **ffuf** - HTTP fuzzing / host probing
+- **puredns** - mass DNS brute-force with wildcard filtering
+- **massdns** - DNS resolver engine used by puredns
+- **resolvers list** - public resolvers at `~/.config/fuzzy/resolvers.txt`
+- **`fuzzy` command** - symlinked at `~/.local/bin/fuzzy`
+- **shell alias** - `alias fuzzy="~/.local/share/fuzzy/fuzzy.py"`
 
-Requires: a Debian/Fedora/Arch/macOS host with `curl`, `git`, `make`, and `gcc`
-(the installer adds missing packages automatically via your package manager).
+> If your terminal locale is not UTF-8, FUZZY automatically falls back to
+> ASCII art. To enable the Unicode banner: `export LANG=en_US.UTF-8`.
 
 ## Usage
 
@@ -62,20 +64,17 @@ fuzzy --help
 | `--dry-run` | print the exact tool commands, don't run |
 | `--download-resolvers` | fetch trickest resolvers if none found |
 | `--clean` | delete the work directory on success |
+| `--debug` | dump raw subprocess output to stderr |
 | `--quiet` | suppress banner and live display |
+| `--no-banner` | suppress banner only |
 
-## How it works
+### Environment variables
 
-1. **DNS stage** — `puredns bruteforce <wordlist> -d <scope.txt>` runs every
-   word against every domain, resolves via `massdns`, strips wildcards, and
-   validates against trusted resolvers. This is the only stage that can
-   realistically chew through a multi-million-word list.
-2. **HTTP stage** — `ffuf -w urls.txt -u FUZZ` probes every resolved host
-   on both `https://` and `http://` to confirm liveness and capture
-   status/size/title.
-
-The output file joins both stages, so DNS-only discoveries (no HTTP
-response) are still recorded.
+| Variable | Effect |
+|---|---|
+| `FUZZY_UNICODE=1` | force Unicode banner/spinner even if locale isn't UTF-8 |
+| `FUZZY_ASCII=1` | force ASCII banner/spinner |
+| `NO_COLOR=1` | disable ANSI colour |
 
 ## Output
 
@@ -89,17 +88,7 @@ url, content_type, title, source
 `source` is `dns` for hosts that only resolved (no HTTP response) and
 `http` for live hosts.
 
-## Work directory
-
-Intermediate files live in `.<output-name>.work/` next to the output file:
-
-- `resolved.txt` — puredns output
-- `urls.txt` — URL list fed to ffuf
-- `http.json` — ffuf raw results
-- `stage1.ok` / `stage2.ok` — resume markers
-
-Use `--resume` to reuse them, or `--clean` to remove them on success.
-
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT - see [LICENSE](LICENSE).
+
