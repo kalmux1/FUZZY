@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-FUZZY — multi-domain subdomain reconnaissance pipeline.
+FUZZY - multi-domain subdomain reconnaissance pipeline.
 
 Stage 1: puredns bruteforce  (mass DNS, wildcard-filtered)
 Stage 2: ffuf host probing    (HTTP/HTTPS liveness on resolved hosts)
@@ -40,7 +40,29 @@ RESOLVER_URL = (
     "https://raw.githubusercontent.com/trickest/resolvers/main/resolvers.txt"
 )
 
-# ────────────────────────────── colour / tty ──────────────────────────────
+
+# ---------------------------------------------------------------- unicode
+
+def _unicode_terminal() -> bool:
+    """True only when the terminal is known to render box/spinner glyphs."""
+    if os.environ.get("FUZZY_ASCII") == "1":
+        return False
+    if os.environ.get("FUZZY_UNICODE") == "1":
+        return True
+    # POSIX precedence: LC_ALL > LC_CTYPE > LANG
+    for var in ("LC_ALL", "LC_CTYPE", "LANG"):
+        val = os.environ.get(var, "")
+        if val:
+            low = val.lower()
+            return "utf-8" in low or "utf8" in low
+    # nothing set - be safe
+    return False
+
+
+UNICODE_OK = _unicode_terminal()
+
+
+# ---------------------------------------------------------------- colour
 
 ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
@@ -92,7 +114,7 @@ def status_colour(code) -> str:
     return C.grey(text)
 
 
-# ────────────────────────────── misc helpers ──────────────────────────────
+# ---------------------------------------------------------------- helpers
 
 def fmt_dur(seconds: float) -> str:
     seconds = int(seconds)
@@ -119,19 +141,21 @@ def fmt_bytes(n) -> str:
 def progress_bar(pct: float, width: int = 26) -> str:
     pct = max(0.0, min(1.0, pct))
     filled = int(width * pct)
-    return "█" * filled + "░" * (width - filled)
+    if UNICODE_OK:
+        return "\u2588" * filled + "\u2591" * (width - filled)
+    return "#" * filled + "." * (width - filled)
 
 
-SPIN = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+SPIN_U = "\u280b\u2819\u2839\u2838\u283c\u2834\u2826\u2827\u2807\u280f"
+SPIN_A = "|/-\\"
 
 
 def spinner_frame(t: float) -> str:
-    return SPIN[int(t * 8) % len(SPIN)]
+    pool = SPIN_U if UNICODE_OK else SPIN_A
+    return pool[int(t * 8) % len(pool)]
 
 
 class LineCounter:
-    """Incrementally count newlines in a growing file."""
-
     def __init__(self, path: Path):
         self.path = path
         self.offset = 0
@@ -160,7 +184,7 @@ class LineCounter:
             return 0
 
 
-# ────────────────────────────── live display ──────────────────────────────
+# ---------------------------------------------------------------- display
 
 class LiveDisplay:
     def __init__(self, enabled: bool = True):
@@ -197,8 +221,6 @@ class LiveDisplay:
 
 
 class Ticker(threading.Thread):
-    """Background redraw loop for stages without machine-readable progress."""
-
     def __init__(self, display: LiveDisplay, render, interval: float = 0.12):
         super().__init__(daemon=True)
         self.display = display
@@ -223,24 +245,31 @@ class Ticker(threading.Thread):
         self.display.finish()
 
 
-# ────────────────────────────── subprocess streaming ──────────────────────────────
+# ---------------------------------------------------------------- procs
 
-ACTIVE_PROC = None
+ACTIVE_PROCS: set = set()
 ACTIVE_LOCK = threading.Lock()
 
 
+def _register(proc):
+    with ACTIVE_LOCK:
+        ACTIVE_PROCS.add(proc)
+
+
+def _unregister(proc):
+    with ACTIVE_LOCK:
+        ACTIVE_PROCS.discard(proc)
+
+
 def stream_process(cmd, on_segment=None, timeout=None, log=None):
-    """Run cmd, stream stdout+stderr, split on \\r and \\n. Returns rc."""
-    global ACTIVE_PROC
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
         bufsize=0,
+        start_new_session=True,   # so we can killpg + reap massdns children
     )
-    with ACTIVE_LOCK:
-        ACTIVE_PROC = proc
-
+    _register(proc)
     start = time.time()
     buf = b""
     try:
@@ -263,12 +292,24 @@ def stream_process(cmd, on_segment=None, timeout=None, log=None):
             on_segment(buf.decode("utf-8", "replace").strip())
     finally:
         rc = proc.wait()
-        with ACTIVE_LOCK:
-            ACTIVE_PROC = None
+        _unregister(proc)
     return rc
 
 
-# ────────────────────────────── ffuf parsing ──────────────────────────────
+def _kill_proc_tree(proc):
+    try:
+        pgid = os.getpgid(proc.pid)
+        os.killpg(pgid, signal.SIGKILL)
+    except ProcessLookupError:
+        pass
+    except Exception:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+
+
+# ---------------------------------------------------------------- ffuf parse
 
 PROG_RE = re.compile(
     r":: Progress: \[(\d+)/(\d+)\] :: Job \[\d+/\d+\] :: "
@@ -308,7 +349,7 @@ def parse_ffuf_json(path: Path):
     return out
 
 
-# ────────────────────────────── input handling ──────────────────────────────
+# ---------------------------------------------------------------- input
 
 DOMAIN_RE = re.compile(
     r"^(?=.{1,253}$)(?!-)[A-Za-z0-9-]{1,63}(?<!-)"
@@ -353,7 +394,7 @@ def root_of(host: str, roots):
     return best
 
 
-# ────────────────────────────── tool runners ──────────────────────────────
+# ---------------------------------------------------------------- stages
 
 def run_puredns(args, paths, display: LiveDisplay, log):
     stage1: Path = paths["stage1"]
@@ -381,8 +422,9 @@ def run_puredns(args, paths, display: LiveDisplay, log):
     def render(elapsed, frame):
         n = counter.poll()
         return (f"{C.magenta(frame)} {C.bold('puredns')} "
-                f"bruteforcing {fmt_int(len(paths['domains']))} domains · "
-                f"{fmt_dur(elapsed)} · {C.cyan(fmt_int(n))} resolved")
+                f"bruteforcing {fmt_int(len(paths['domains']))} domains "
+                f"| {fmt_dur(elapsed)} | "
+                f"{C.cyan(fmt_int(n))} resolved")
 
     with Ticker(display, render):
         rc = stream_process(cmd, lambda s: log(f"puredns: {s}"),
@@ -474,7 +516,6 @@ def run_ffuf_host_probe(hosts, args, paths, display: LiveDisplay, log):
 
 
 def run_ffuf_fallback(domains, args, paths, display: LiveDisplay, log):
-    """Per-domain ffuf brute-force — slow, only used when puredns is absent."""
     results = []
     done = 0
     total = len(domains)
@@ -489,8 +530,7 @@ def run_ffuf_fallback(domains, args, paths, display: LiveDisplay, log):
                "-t", str(args.threads),
                "-timeout", str(args.timeout),
                "-H", f"User-Agent: {args.ua}",
-               "-o", str(out_json), "-of", "json",
-               "-ac"]
+               "-o", str(out_json), "-of", "json", "-ac"]
         if args.rate:
             cmd += ["-rate", str(args.rate)]
         if args.insecure:
@@ -500,12 +540,23 @@ def run_ffuf_fallback(domains, args, paths, display: LiveDisplay, log):
         if args.dry_run:
             display.line(C.bold("[dry-run] ") + " ".join(cmd))
             return domain, []
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            start_new_session=True,
+        )
+        _register(proc)
         try:
-            subprocess.run(cmd, stdout=subprocess.DEVNULL,
-                           stderr=subprocess.DEVNULL,
-                           timeout=args.max_runtime or None)
-        except subprocess.TimeoutExpired:
-            log(f"fallback timeout: {domain}")
+            try:
+                proc.wait(timeout=args.max_runtime or None)
+            except subprocess.TimeoutExpired:
+                log(f"fallback timeout: {domain}")
+                _kill_proc_tree(proc)
+                proc.wait()
+        finally:
+            _unregister(proc)
         return domain, parse_ffuf_json(out_json)
 
     with ThreadPoolExecutor(max_workers=args.workers) as pool:
@@ -523,7 +574,7 @@ def run_ffuf_fallback(domains, args, paths, display: LiveDisplay, log):
             frame = spinner_frame(time.time())
             display.update(
                 f"{C.blue(frame)} {C.bold('ffuf')} fallback "
-                f"{progress_bar(done/total)} {done}/{total} domains · "
+                f"{progress_bar(done/total)} {done}/{total} domains | "
                 f"{C.green(str(len(results)))} hits"
             )
             for r in found:
@@ -535,7 +586,7 @@ def run_ffuf_fallback(domains, args, paths, display: LiveDisplay, log):
     return results
 
 
-# ────────────────────────────── results / output ──────────────────────────────
+# ---------------------------------------------------------------- output
 
 def build_rows(domains, resolved_hosts, ffuf_rows, roots):
     rows = {}
@@ -601,16 +652,21 @@ def print_summary(rows, args, elapsed, paths):
         bucket = f"{s // 100}xx" if s else "???"
         by_status[bucket] = by_status.get(bucket, 0) + 1
 
-    line = "─" * 54
+    if UNICODE_OK:
+        tl, tr, bl, br, h, v = "\u256d", "\u256e", "\u2570", "\u256f", "\u2500", "\u2502"
+    else:
+        tl, tr, bl, br, h, v = "+", "+", "+", "+", "-", "|"
+
+    line = h * 54
     print()
-    print(C.grey("╭" + line + "╮"))
-    print(C.grey("│") + C.bold("  SUMMARY").ljust(54 + 9) + C.grey("│"))
-    print(C.grey("├" + line + "┤"))
+    print(C.grey(tl + line + tr))
+    print(C.grey(v) + C.bold("  SUMMARY").ljust(54 + 9) + C.grey(v))
+    print(C.grey("+" + line + "+"))
 
     def row(label, value, colour=str):
         left = f"  {label:<22}"
         right = f"{value:>28}"
-        print(C.grey("│") + left + colour(right) + C.grey("  │"))
+        print(C.grey(v) + left + colour(right) + C.grey("  " + v))
 
     row("input domains", fmt_int(len(paths["domains"])))
     row("wordlist entries", fmt_int(paths["wordlist_lines"]))
@@ -621,15 +677,16 @@ def print_summary(rows, args, elapsed, paths):
         row(f"  status {bucket}", fmt_int(by_status[bucket]),
             C.green if bucket == "2xx" else C.yellow)
     row("elapsed", fmt_dur(elapsed), C.magenta)
-    print(C.grey("╰" + line + "╯"))
-    print(f"  results → {C.bold(str(args.output))}")
+    print(C.grey(bl + line + br))
+    arrow = "\u2192" if UNICODE_OK else "->"
+    print(f"  results {arrow} {C.bold(str(args.output))}")
     if paths["work"].exists():
-        print(f"  workdir → {C.grey(str(paths['work']))}")
+        print(f"  workdir {arrow} {C.grey(str(paths['work']))}")
 
 
-# ────────────────────────────── banner ──────────────────────────────
+# ---------------------------------------------------------------- banner
 
-BANNER = r"""
+UNICODE_BANNER = r"""
 ███████╗██╗   ██╗███████╗███████╗██╗   ██╗
 ██╔════╝██║   ██║╚══███╔╝╚══███╔╝╚██╗ ██╔╝
 █████╗  ██║   ██║  ███╔╝   ███╔╝  ╚████╔╝ 
@@ -638,15 +695,24 @@ BANNER = r"""
 ╚═╝      ╚═════╝ ╚══════╝╚══════╝   ╚═╝   
 """.strip("\n").splitlines()
 
+ASCII_BANNER = r"""
+______  __  __  ____  ____ __   __
+|  ___| | | | |___ \|___ \ \ \ / /
+| |_    | | | |  __) |  __) \ V / 
+|  _|   | |_| | / __/ / __/   | |  
+|_|      \___/ |_____|_____|  |_|  
+""".strip("\n").splitlines()
+
 
 def show_banner(animate: bool = True):
+    lines = UNICODE_BANNER if UNICODE_OK else ASCII_BANNER
     palette = [51, 45, 39, 33, 27, 21]
-    for i, line in enumerate(BANNER):
+    for i, line in enumerate(lines):
         print(C.c256(palette[i % len(palette)], line))
 
-    tagline = "multi-domain subdomain reconnaissance  ·  puredns × ffuf"
-    print(C.grey(f"  v{VERSION}  ·  {tagline}"))
-    print(C.magenta(f"  by {AUTHOR}") + C.grey(f"  ·  {REPO}"))
+    tag = "multi-domain subdomain reconnaissance | puredns x ffuf"
+    print(C.grey(f"  v{VERSION}  |  {tag}"))
+    print(C.magenta(f"  by {AUTHOR}") + C.grey(f"  |  {REPO}"))
     print()
     if animate and sys.stdout.isatty():
         msg = "  initialising pipeline"
@@ -660,13 +726,13 @@ def show_banner(animate: bool = True):
         sys.stdout.flush()
 
 
-# ────────────────────────────── CLI ──────────────────────────────
+# ---------------------------------------------------------------- CLI
 
 def parse_args(argv=None):
     p = argparse.ArgumentParser(
         prog="fuzzy",
-        description="FUZZY — enumerate subdomains across a list of domains "
-                    "using puredns (DNS) + ffuf (HTTP liveness).",
+        description=("FUZZY - enumerate subdomains across a list of domains "
+                     "using puredns (DNS) + ffuf (HTTP liveness)."),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 examples:
@@ -689,9 +755,12 @@ examples:
     eng = p.add_argument_group("engine")
     eng.add_argument("-r", "--resolvers", type=Path,
                      help="puredns resolver list (default: auto-detect)")
-    eng.add_argument("--puredns-bin", default="puredns")
-    eng.add_argument("--ffuf-bin", default="ffuf")
-    eng.add_argument("--massdns-bin", help="explicit massdns path for puredns")
+    eng.add_argument("--puredns-bin", default="puredns",
+                     help="puredns binary name (default: puredns)")
+    eng.add_argument("--ffuf-bin", default="ffuf",
+                     help="ffuf binary name (default: ffuf)")
+    eng.add_argument("--massdns-bin",
+                     help="explicit massdns path for puredns")
     eng.add_argument("--ffuf-only", action="store_true",
                      help="skip puredns; brute-force each domain with ffuf "
                           "(slow fallback)")
@@ -704,9 +773,9 @@ examples:
     perf.add_argument("-t", "--threads", type=int, default=100,
                       help="ffuf threads per process (default 100)")
     perf.add_argument("--rate", type=int, default=150,
-                      help="ffuf requests/second cap (default 150, 0=unlimited)")
+                      help="ffuf req/s cap (default 150, 0=unlimited)")
     perf.add_argument("--timeout", type=int, default=5,
-                      help="ffuf per-request timeout in seconds (default 5)")
+                      help="ffuf per-request timeout seconds (default 5)")
     perf.add_argument("--workers", type=int, default=4,
                       help="parallel domains in --ffuf-only mode (default 4)")
     perf.add_argument("--max-runtime", type=int, default=0,
@@ -715,47 +784,57 @@ examples:
     dns = p.add_argument_group("puredns tuning")
     dns.add_argument("--wildcard-tests", type=int, default=0,
                      help="puredns --wildcard-tests (raise for load-balanced DNS)")
-    dns.add_argument("--skip-wildcard", action="store_true")
-    dns.add_argument("--skip-validation", action="store_true")
-    dns.add_argument("--rate-limit-trusted", type=int, default=0)
+    dns.add_argument("--skip-wildcard", action="store_true",
+                     help="disable wildcard filtering (puredns)")
+    dns.add_argument("--skip-validation", action="store_true",
+                     help="skip puredns validation step")
+    dns.add_argument("--rate-limit-trusted", type=int, default=0,
+                     help="puredns --rate-limit-trusted value")
 
     http = p.add_argument_group("http probing")
     http.add_argument("--https-only", action="store_true",
                       help="probe only https:// (skip http:// pass)")
     http.add_argument("--mc", default="200,204,301,302,307,401,403,405",
                       help="ffuf status-code matcher")
-    http.add_argument("--ua", default=DEFAULT_UA, help="User-Agent header")
+    http.add_argument("--ua", default=DEFAULT_UA,
+                      help="User-Agent header sent by ffuf")
     http.add_argument("--ac", action="store_true",
-                      help="enable ffuf auto-calibration (default off for "
-                           "host probing; always on in --ffuf-only)")
-    http.add_argument("--proxy", help="upstream proxy for ffuf (-x)")
+                      help="enable ffuf auto-calibration for host probing")
+    http.add_argument("--proxy",
+                      help="upstream proxy for ffuf (-x)")
     http.add_argument("-k", "--insecure", action="store_true",
                       help="skip TLS verification in ffuf")
 
     out = p.add_argument_group("output / runtime")
-    out.add_argument("--format", choices=("csv", "json", "txt"), default="csv")
+    out.add_argument("--format", choices=("csv", "json", "txt"), default="csv",
+                     help="output format (default csv)")
     out.add_argument("--resume", action="store_true",
                      help="reuse completed stages from the work directory")
     out.add_argument("--clean", action="store_true",
                      help="remove the work directory on success")
-    out.add_argument("--log", type=Path, help="debug log path")
-    out.add_argument("--debug", action="store_true")
-    out.add_argument("--quiet", action="store_true")
-    out.add_argument("--no-banner", action="store_true")
-    out.add_argument("--dry-run", action="store_true")
+    out.add_argument("--log", type=Path,
+                     help="debug log path (default: <output>.log)")
+    out.add_argument("--debug", action="store_true",
+                     help="print raw subprocess output to stderr")
+    out.add_argument("--quiet", action="store_true",
+                     help="suppress banner and live display")
+    out.add_argument("--no-banner", action="store_true",
+                     help="suppress banner only (keep live display)")
+    out.add_argument("--dry-run", action="store_true",
+                     help="print commands that would be run, don't execute")
     out.add_argument("--version", action="version",
-                     version=f"%(prog)s {VERSION}")
+                     version=f"%(prog)s {VERSION}  by {AUTHOR}")
     return p.parse_args(argv)
 
 
-# ────────────────────────────── main ──────────────────────────────
+# ---------------------------------------------------------------- main
 
 def find_resolvers(args, display, log):
     candidates = []
     if args.resolvers:
         candidates.append(args.resolvers)
     candidates += [
-        Path.home() / ".config/fuzzy/resolvers.txt",   # installer default
+        Path.home() / ".config/fuzzy/resolvers.txt",
         Path("resolvers.txt"),
         Path.home() / ".config/puredns/resolvers.txt",
     ]
@@ -763,8 +842,9 @@ def find_resolvers(args, display, log):
         if c and c.is_file() and c.stat().st_size > 0:
             return c
     if args.download_resolvers:
-        target = args.resolvers or Path("resolvers.txt")
-        display.line(C.cyan(f"  [*] downloading resolvers → {target}"))
+        target = args.resolvers or (Path.home() / ".config/fuzzy/resolvers.txt")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        display.line(C.cyan(f"  [*] downloading resolvers -> {target}"))
         req = Request(RESOLVER_URL, headers={"User-Agent": DEFAULT_UA})
         with urlopen(req, timeout=30) as resp:
             target.write_bytes(resp.read())
@@ -773,13 +853,20 @@ def find_resolvers(args, display, log):
 
 
 def main(argv=None) -> int:
+    argv = list(sys.argv[1:] if argv is None else argv)
+
+    # ---- banner BEFORE parse_args so -h/--version still show it ---------
+    suppress_banner = any(a in argv for a in ("--no-banner", "--quiet"))
+    if not suppress_banner:
+        fast = any(a in argv for a in ("-h", "--help", "--version", "--dry-run"))
+        show_banner(animate=not fast)
+
     args = parse_args(argv)
     start = time.time()
 
-    if not args.no_banner and not args.quiet:
-        show_banner(animate=not args.dry_run)
-
     def log(msg: str):
+        if args.debug:
+            print(C.grey(f"  [dbg] {msg}"), file=sys.stderr)
         if not args.log:
             return
         try:
@@ -795,6 +882,9 @@ def main(argv=None) -> int:
         args.log = output.with_suffix(output.suffix + ".log")
 
     # ---- preflight -------------------------------------------------------
+    if args.ffuf_only and args.puredns_only:
+        display.line(C.red("[!] --ffuf-only and --puredns-only are mutually exclusive"))
+        return 1
     if not args.input.is_file():
         display.line(C.red(f"[!] input file not found: {args.input}"))
         return 1
@@ -809,18 +899,17 @@ def main(argv=None) -> int:
     wordlist_lines = len(load_lines(args.wordlist))
     if wordlist_lines < 1000:
         display.line(C.yellow(
-            f"  [!] wordlist has only {fmt_int(wordlist_lines)} entries — "
+            f"  [!] wordlist has only {fmt_int(wordlist_lines)} entries - "
             "n0kovo's list should be >1M. Re-download it."))
 
     if not args.ffuf_only and shutil.which(args.puredns_bin) is None:
         display.line(C.yellow(
-            f"  [!] '{args.puredns_bin}' not found — falling back to ffuf-only"))
+            f"  [!] '{args.puredns_bin}' not found - falling back to ffuf-only"))
         args.ffuf_only = True
     if shutil.which(args.ffuf_bin) is None and not args.puredns_only:
         display.line(C.red(f"[!] '{args.ffuf_bin}' not found in PATH"))
         return 1
 
-    resolvers = None
     if not args.ffuf_only:
         resolvers = find_resolvers(args, display, log)
         if resolvers is None:
@@ -850,7 +939,7 @@ def main(argv=None) -> int:
         if args.resume and marker1.exists() and paths["stage1"].exists():
             display.line(C.grey("  [=] reusing stage 1 (DNS) results"))
         else:
-            display.line(C.bold("  [1/2] DNS brute-force — puredns"))
+            display.line(C.bold("  [1/2] DNS brute-force - puredns"))
             rc = run_puredns(args, paths, display, log)
             if rc != 0:
                 display.line(C.yellow(f"  [!] puredns exited {rc}"))
@@ -877,7 +966,7 @@ def main(argv=None) -> int:
             display.line(C.grey("  [=] reusing stage 2 (HTTP) results"))
             ffuf_rows = parse_ffuf_json(paths["stage2"])
         else:
-            display.line(C.bold("  [2/2] HTTP probe — ffuf"))
+            display.line(C.bold("  [2/2] HTTP probe - ffuf"))
             rc = run_ffuf_host_probe(resolved_hosts, args, paths, display, log)
             if rc not in (0, 1):
                 display.line(C.yellow(f"  [!] ffuf exited {rc}"))
@@ -913,6 +1002,10 @@ def main(argv=None) -> int:
 
 
 def _sigint(_signum, _frame):
+    with ACTIVE_LOCK:
+        procs = list(ACTIVE_PROCS)
+    for p in procs:
+        _kill_proc_tree(p)
     raise KeyboardInterrupt
 
 
@@ -921,10 +1014,7 @@ if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        with ACTIVE_LOCK:
-            if ACTIVE_PROC and ACTIVE_PROC.poll() is None:
-                ACTIVE_PROC.kill()
-        print(C.yellow("\n[!] interrupted — partial work kept in the work dir"))
+        print(C.yellow("\n[!] interrupted - partial work kept in the work dir"))
         sys.exit(130)
     except BrokenPipeError:
         sys.exit(1)
