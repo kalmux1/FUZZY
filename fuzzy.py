@@ -710,9 +710,9 @@ def show_banner(animate: bool = True):
     for i, line in enumerate(lines):
         print(C.c256(palette[i % len(palette)], line))
 
-    tag = "multi-domain subdomain reconnaissance | puredns x ffuf"
+    tag = "Multi-Domain Subdomain Reconnaissance | Puredns x Ffuf"
     print(C.grey(f"  v{VERSION}  |  {tag}"))
-    print(C.magenta(f"  by {AUTHOR}") + C.grey(f"  |  {REPO}"))
+    print(C.magenta(f"          By {AUTHOR}") + C.grey(f"  |  {REPO}"))
     print()
     if animate and sys.stdout.isatty():
         msg = "  initialising pipeline"
