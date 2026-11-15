@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# FUZZY installer — installs ffuf, puredns, massdns, resolvers, and the fuzzy CLI.
+# FUZZY installer - installs ffuf, puredns, massdns, resolvers, and the fuzzy CLI.
 # Author: Kalmux
 
 set -euo pipefail
@@ -13,7 +13,6 @@ GO_VERSION="1.22.5"
 GO_MIN_MAJOR=1
 GO_MIN_MINOR=21
 
-# ── colours ──────────────────────────────────────────────────────────────
 if [ -t 1 ]; then
   R=$'\033[0;31m'; G=$'\033[0;32m'; Y=$'\033[0;33m'
   C=$'\033[0;36m'; M=$'\033[0;35m'; W=$'\033[1m'; N=$'\033[0m'
@@ -28,20 +27,18 @@ err()  { printf "${R}[x]${N} %s\n" "$*" >&2; }
 banner() {
   printf "${C}"
   cat <<'EOF'
-███████╗██╗   ██╗███████╗███████╗██╗   ██╗
-██╔════╝██║   ██║╚══███╔╝╚══███╔╝╚██╗ ██╔╝
-█████╗  ██║   ██║  ███╔╝   ███╔╝  ╚████╔╝ 
-██╔══╝  ██║   ██║ ███╔╝   ███╔╝    ╚██╔╝  
-██║     ╚██████╔╝███████╗███████╗   ██║   
-╚═╝      ╚═════╝ ╚══════╝╚══════╝   ╚═╝   
+______  __  __  ____  ____ __   __
+|  ___| | | | |___ \|___ \ \ \ / /
+| |_    | | | |  __) |  __) \ V / 
+|  _|   | |_| | / __/ / __/   | |  
+|_|      \___/ |_____|_____|  |_|  
 EOF
   printf "${N}"
-  printf "${M}  installer  ·  v%s  ·  by Kalmux${N}\n\n" "$VERSION"
+  printf "${M}  installer  |  v%s  |  by Kalmux${N}\n\n" "$VERSION"
 }
 
 banner
 
-# ── OS / arch ────────────────────────────────────────────────────────────
 case "$(uname -s)" in
   Linux)  OS="linux";;
   Darwin) OS="macos";;
@@ -53,14 +50,13 @@ case "$(uname -m)" in
   *) err "Unsupported arch: $(uname -m)"; exit 1;;
 esac
 
-# ── package manager ──────────────────────────────────────────────────────
 PM=""
 if   command -v apt-get >/dev/null 2>&1; then PM="apt"
 elif command -v dnf     >/dev/null 2>&1; then PM="dnf"
 elif command -v pacman  >/dev/null 2>&1; then PM="pacman"
 elif command -v brew    >/dev/null 2>&1; then PM="brew"
 fi
-[ -n "$PM" ] || warn "no package manager detected — falling back to Go/manual"
+[ -n "$PM" ] || warn "no package manager detected - falling back to Go/manual"
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
@@ -75,7 +71,6 @@ install_pkg() {
   esac
 }
 
-# ── shell rc / PATH helpers ──────────────────────────────────────────────
 detect_rc() {
   case "${SHELL##*/}" in
     zsh)  echo "$HOME/.zshrc";;
@@ -92,19 +87,21 @@ ensure_path_in() {
   ok "added $dir to PATH in $rc"
 }
 
-# ── system prerequisites ─────────────────────────────────────────────────
-for c in curl git make; do
+# ---- system prerequisites ------------------------------------------------
+for c in python3 curl git make; do
   if ! have "$c"; then
     say "installing $c"
     install_pkg "$c" || { err "cannot install $c"; exit 1; }
   fi
 done
+ok "python3: $(python3 --version 2>&1)"
+
 have gcc || { say "installing compiler"; install_pkg build-essential 2>/dev/null \
-              || install_pkg gcc 2>/dev/null || warn "no compiler — massdns build may fail"; }
+              || install_pkg gcc 2>/dev/null || warn "no compiler - massdns build may fail"; }
 
 mkdir -p "$FUZZY_HOME" "$FUZZY_BIN" "$FUZZY_CONFIG" "$HOME/.local"
 
-# ── Go ───────────────────────────────────────────────────────────────────
+# ---- Go ------------------------------------------------------------------
 go_ok() {
   have go || return 1
   local v; v=$(go version 2>/dev/null | awk '{print $3}' | sed 's/^go//')
@@ -126,7 +123,7 @@ if ! go_ok; then
 fi
 ok "Go: $(go version | awk '{print $3}')"
 
-# ── ffuf ─────────────────────────────────────────────────────────────────
+# ---- ffuf ----------------------------------------------------------------
 if ! have ffuf; then
   say "installing ffuf"
   if install_pkg ffuf 2>/dev/null; then
@@ -137,7 +134,7 @@ if ! have ffuf; then
   fi
 fi
 
-# ── massdns ──────────────────────────────────────────────────────────────
+# ---- massdns -------------------------------------------------------------
 if ! have massdns; then
   say "building massdns from source"
   tmpdir=$(mktemp -d)
@@ -151,7 +148,7 @@ if ! have massdns; then
 fi
 ensure_path_in "$FUZZY_BIN"
 
-# ── puredns ──────────────────────────────────────────────────────────────
+# ---- puredns -------------------------------------------------------------
 if ! have puredns; then
   say "installing puredns"
   GOBIN="$FUZZY_BIN" go install github.com/d3mondev/puredns/v2@latest
@@ -159,7 +156,7 @@ if ! have puredns; then
 fi
 ensure_path_in "$FUZZY_BIN"
 
-# ── resolvers ────────────────────────────────────────────────────────────
+# ---- resolvers -----------------------------------------------------------
 RESOLVER_FILE="$FUZZY_CONFIG/resolvers.txt"
 if [ -s "$RESOLVER_FILE" ]; then
   ok "resolvers already present: $RESOLVER_FILE ($(wc -l < "$RESOLVER_FILE") lines)"
@@ -169,7 +166,7 @@ else
   ok "resolvers: $RESOLVER_FILE ($(wc -l < "$RESOLVER_FILE") lines)"
 fi
 
-# ── fuzzy CLI ────────────────────────────────────────────────────────────
+# ---- fuzzy CLI -----------------------------------------------------------
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 SRC_PY="$SCRIPT_DIR/fuzzy.py"
 [ -f "$SRC_PY" ] || { err "fuzzy.py not found next to install.sh"; exit 1; }
@@ -180,7 +177,6 @@ chmod +x "$FUZZY_HOME/fuzzy.py"
 ln -sf "$FUZZY_HOME/fuzzy.py" "$FUZZY_BIN/fuzzy"
 ok "symlink: $FUZZY_BIN/fuzzy"
 
-# shell alias (works in interactive shells; symlink covers scripts / sudo)
 RC="$(detect_rc)"
 if ! grep -qF "# FUZZY alias" "$RC" 2>/dev/null; then
   printf '\n# FUZZY alias\nalias fuzzy="%s/fuzzy.py"\n' "$FUZZY_HOME" >> "$RC"
@@ -188,7 +184,7 @@ if ! grep -qF "# FUZZY alias" "$RC" 2>/dev/null; then
 fi
 ensure_path_in "$FUZZY_BIN" "$RC"
 
-# ── verify ───────────────────────────────────────────────────────────────
+# ---- verify --------------------------------------------------------------
 export PATH="$FUZZY_BIN:$PATH"
 echo
 for tool in fuzzy ffuf puredns massdns; do
@@ -204,3 +200,10 @@ printf "${G}${W}Install complete.${N}\n"
 printf "  Reload shell:  ${C}exec \$SHELL${N}   (or open a new terminal)\n"
 printf "  Try it:        ${C}fuzzy -i scope.txt -w /path/to/n0kovo.txt -o out.csv${N}\n"
 printf "  Help:          ${C}fuzzy --help${N}\n"
+echo
+if ! locale | grep -qi 'utf-\?8'; then
+  warn "terminal locale is not UTF-8 - FUZZY will fall back to ASCII art."
+  warn "to enable Unicode banner:  export LANG=en_US.UTF-8"
+fi
+
+
