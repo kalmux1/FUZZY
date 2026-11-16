@@ -490,9 +490,13 @@ ensure_path_in "$FUZZY_BIN" "$RC"
 
 export PATH="$FUZZY_BIN:$PATH"
 
-printf "\n"
+_hdr_label="toolchain"
+_hdr_len=${#_hdr_label}
+_hdr_lpad=$(( (44 - _hdr_len) / 2 ))
+_hdr_rpad=$(( 44 - _hdr_len - _hdr_lpad ))
 printf "  ${C}%s%s%s${N}\n" "$TL" "$(printf "%0.s${H}" $(seq 1 44))" "$TR"
-printf "  ${C}%s${N}  ${W}%-40s${N}${C}%s${N}\n" "$V" "toolchain" "$V"
+printf "  ${C}%s${N}%*s${W}%s${N}%*s${C}%s${N}\n" \
+    "$V" "$_hdr_lpad" "" "$_hdr_label" "$_hdr_rpad" "" "$V"
 printf "  ${C}%s%s%s${N}\n" "$BL" "$(printf "%0.s${H}" $(seq 1 44))" "$BR"
 
 for tool in fuzzy ffuf puredns massdns; do
@@ -504,7 +508,7 @@ for tool in fuzzy ffuf puredns massdns; do
 done
 
 printf "\n"
-printf "${G}${W}Install complete.${N}\n"
+printf "${G}${W}Install complete.${N}\n\n"
 printf "  Reload shell:  ${C}exec \$SHELL${N}   (or open a new terminal)\n"
 printf "  Try it:        ${C}fuzzy -i scope.txt -w /path/to/n0kovo.txt -o out.csv${N}\n"
 printf "  Help:          ${C}fuzzy --help${N}\n"
