@@ -1,12 +1,12 @@
 <div align="center">
-  
-```text
-        ╭────────────────────────────────────────────╮
-        │                 F U Z Z Y                  │
-        ╰────────────────────────────────────────────╯
-              Multi-Domain Subdomain Reconnaissance
-                  Puredns x Ffuf  |  By Kalmux
-```
+<pre>
+╭────────────────────────────────────────────╮
+│                 F U Z Z Y                  │
+╰────────────────────────────────────────────╯
+    Multi-Domain Subdomain Reconnaissance
+        Puredns x Ffuf  |  By Kalmux
+</pre>
+</div>
 
 </div>
 
