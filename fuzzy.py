@@ -30,7 +30,7 @@ from pathlib import Path
 from urllib.parse import urlsplit
 from urllib.request import Request, urlopen
 
-VERSION = "1.0.0"
+VERSION = "1.0.1"
 AUTHOR  = "Kalmux"
 REPO    = "https://github.com/kalmux/fuzzy"
 
@@ -165,7 +165,6 @@ def spinner_frame(t: float) -> str:
 
 
 def sanitize_csv_cell(v) -> str:
-    """Neutralise CSV formula injection."""
     if v is None:
         return ""
     s = str(v)
@@ -186,7 +185,6 @@ def count_lines(path: Path) -> int:
 
 
 def stage_fingerprint(*files) -> str:
-    """Hash of stage inputs so --resume can detect staleness."""
     h = hashlib.sha256()
     for f in files:
         if f is None:
@@ -312,11 +310,6 @@ def _kill_proc_tree(proc):
 
 
 def stream_process(cmd, on_segment=None, timeout=None, log=None):
-    """Stream subprocess output with a real wall-clock timeout.
-
-    Uses ``select`` so a silent child is still timed out, and kills the
-    whole process group (so massdns children of puredns die too).
-    """
     proc = subprocess.Popen(
         cmd,
         stdout=subprocess.PIPE,
@@ -379,6 +372,12 @@ RESULT_RE = re.compile(
     r"^(?P<url>\S+)\s+\[Status:\s*(?P<status>\d+),\s*Size:\s*(?P<size>\d+),"
     r"\s*Words:\s*(?P<words>\d+),\s*Lines:\s*(?P<lines>\d+)"
     r"(?:,\s*Duration:\s*[\d.]+\s*(?:ms|s))?\]"
+)
+
+# puredns progress line (after ANSI stripping), e.g.:
+# [ETA 05:33:19] |█░░░░░░| 150/3000001 rate: 150 qps (time: 00:00:00)
+PUREDNS_PROG_RE = re.compile(
+    r"\[ETA\s+([\d:]+)\].*?(\d+)/(\d+)\s+rate:\s+(\d+)\s+qps"
 )
 
 
@@ -447,7 +446,6 @@ def load_lines(path: Path):
 
 
 def root_of(host: str, roots_set: set) -> str:
-    """Return longest matching root by walking host suffixes."""
     parts = host.split(".")
     for i in range(len(parts)):
         candidate = ".".join(parts[i:])
@@ -460,7 +458,7 @@ def root_of(host: str, roots_set: set) -> str:
 
 def build_puredns_cmd(args, batch, out: Path):
     cmd = [args.puredns_bin, "bruteforce", str(args.wordlist)]
-    cmd += [str(d) for d in batch]                    # positional domains
+    cmd += [str(d) for d in batch]
     cmd += ["-r", str(args.resolvers), "-w", str(out)]
     if args.massdns_bin:
         cmd += ["--bin", args.massdns_bin]
@@ -472,8 +470,9 @@ def build_puredns_cmd(args, batch, out: Path):
         cmd.append("--skip-validation")
     if args.rate_limit_trusted:
         cmd += ["--rate-limit-trusted", str(args.rate_limit_trusted)]
-    if args.rate:
-        cmd += ["--rate-limit", str(args.rate)]
+    # v1.0.1: use --dns-rate (default 0 = unlimited) instead of --rate
+    if args.dns_rate:
+        cmd += ["--rate-limit", str(args.dns_rate)]
     return cmd
 
 
@@ -497,6 +496,9 @@ def run_puredns(args, paths, domains, display, log):
     workers = max(1, args.workers)
     done = [0]
     total_resolved = [0]
+    progress = {}                       # batch_idx -> (cur, total, qps, eta)
+    last_line = [""]
+    last_line_time = [0.0]
     lock = threading.Lock()
 
     def run_batch(idx, batch):
@@ -504,7 +506,21 @@ def run_puredns(args, paths, domains, display, log):
         if out.exists():
             out.unlink()
         cmd = build_puredns_cmd(args, batch, out)
-        rc = stream_process(cmd, lambda s: log(f"puredns: {s}"),
+
+        def on_line(line):
+            clean = ANSI_RE.sub("", line).strip()
+            if clean:
+                with lock:
+                    last_line[0] = clean
+                    last_line_time[0] = time.time()
+            m = PUREDNS_PROG_RE.search(clean)
+            if m:
+                eta, cur, tot, qps = m.groups()
+                with lock:
+                    progress[idx] = (int(cur), int(tot), int(qps), eta)
+            log(f"puredns: {line}")
+
+        rc = stream_process(cmd, on_line,
                             timeout=args.max_runtime, log=log)
         n = 0
         if out.exists():
@@ -516,9 +532,49 @@ def run_puredns(args, paths, domains, display, log):
         return out, rc
 
     def render(elapsed, frame):
-        return (f"{C.magenta(frame)} {C.bold('puredns')} "
-                f"batches {done[0]}/{len(batches)} | {fmt_dur(elapsed)} | "
-                f"{C.cyan(fmt_int(total_resolved[0]))} resolved")
+        with lock:
+            d = done[0]
+            tr = total_resolved[0]
+            prog = dict(progress)
+            ll = last_line[0]
+            ll_age = time.time() - last_line_time[0]
+
+        # Aggregate across all in-flight batches
+        cur_total = sum(p[0] for p in prog.values())
+        grand_total = sum(p[1] for p in prog.values())
+        qps = sum(p[2] for p in prog.values())
+        eta = ""
+        if prog:
+            etas = [p[3] for p in prog.values() if p[3]]
+            if etas:
+                # show the slowest ETA
+                def _key(s):
+                    parts = s.split(":")
+                    if len(parts) == 3:
+                        h, m, sec = (int(x) for x in parts)
+                    else:
+                        h, m, sec = 0, int(parts[0]), int(parts[1])
+                    return h * 3600 + m * 60 + sec
+                eta = max(etas, key=_key)
+
+        base = (f"{C.magenta(frame)} {C.bold('puredns')} ")
+        if grand_total > 0:
+            pct = cur_total / grand_total
+            return (base
+                    + f"{progress_bar(pct, 18)} {pct*100:5.1f}%  "
+                    + f"{fmt_int(cur_total)}/{fmt_int(grand_total)}  "
+                    + f"{qps} qps  ETA {eta or '--:--:--'}  "
+                    + f"{C.cyan(fmt_int(tr))} resolved  "
+                    + f"batch {min(d+1, len(batches))}/{len(batches)}")
+
+        # No progress line yet (startup) — show what we know
+        suffix = ""
+        if ll and ll_age < 4:
+            suffix = f" {C.grey('| ' + ll[:50])}"
+        return (base
+                + f"batch {min(d+1, len(batches))}/{len(batches)} "
+                + f"| {fmt_dur(elapsed)} | "
+                + f"{C.cyan(fmt_int(tr))} resolved" + suffix)
 
     all_rc = 0
     stage_files = []
@@ -558,7 +614,7 @@ def build_host_probe_cmd(args, urls_file: Path, out_json: Path):
            "-timeout", str(args.timeout),
            "-H", f"User-Agent: {args.ua}",
            "-o", str(out_json), "-of", "json"]
-    if args.rate:
+    if args.rate:                       # --rate applies to ffuf only now
         cmd += ["-rate", str(args.rate)]
     if args.ac:
         cmd.append("-ac")
@@ -714,7 +770,6 @@ def build_rows(resolved_hosts, ffuf_rows, roots_set):
         if not host:
             continue
         existing = rows.get(host)
-        # Deterministic conflict resolution: prefer https over http.
         if existing and existing.get("source") == "http":
             if not (url.startswith("https://")
                     and not (existing.get("url") or "").startswith("https://")):
@@ -815,11 +870,10 @@ def print_summary(rows, args, elapsed, paths, ffuf_only=False):
 # ---------------------------------------------------------------- banner
 
 def show_banner(animate: bool = True):
-    """Minimalist banner. Skips non-TTY unless FUZZY_FORCE_BANNER=1."""
     if not sys.stdout.isatty() and os.environ.get("FUZZY_FORCE_BANNER") != "1":
         return
 
-    W = 44                       # inner box width (dashes between corners)
+    W = 44
     title = "F U Z Z Y"
 
     if UNICODE_OK:
@@ -828,23 +882,20 @@ def show_banner(animate: bool = True):
         tl, tr, bl, br, h, v = "+", "+", "+", "+", "-", "|"
 
     indent = "  "
-    inner = W + 2               # full box width including │ │
+    inner = W + 2
 
     top = tl + h * W + tr
     mid = v + title.center(W) + v
     bot = bl + h * W + br
 
-    # ---- box ---------------------------------------------------------
     for line in (top, mid, bot):
         print(indent + C.cyan(line))
 
-    # ---- info line 1 : Multi-Domain Subdomain Reconnaissance ---------
     l1 = "Multi-Domain Subdomain Reconnaissance"
     pad_l = max(0, (inner - len(l1)) // 2)
     pad_r = max(0, inner - len(l1) - pad_l)
     print(indent + " " * pad_l + C.cyan(l1) + " " * pad_r)
 
-    # ---- info line 2 : Puredns x Ffuf  |  By Kalmux ------------------
     part_a, sep, part_b = "Puredns x Ffuf", "  |  ", "By Kalmux"
     l2 = part_a + sep + part_b
     pad_l = max(0, (inner - len(l2)) // 2)
@@ -855,7 +906,6 @@ def show_banner(animate: bool = True):
 
     print()
 
-    # ---- subtle startup animation ------------------------------------
     if animate and sys.stdout.isatty():
         msg = "  initialising pipeline"
         sys.stdout.write(C.cyan(msg))
@@ -913,10 +963,13 @@ examples:
                      help="fetch the trickest resolver list if none is found")
 
     perf = p.add_argument_group("performance")
+    perf.add_argument("--dns-rate", type=int, default=0,
+                      help="puredns DNS rate limit in qps "
+                           "(default 0 = unlimited, let massdns fly)")
+    perf.add_argument("--rate", type=int, default=150,
+                      help="ffuf HTTP rate limit in qps (default 150)")
     perf.add_argument("-t", "--threads", type=int, default=100,
                       help="ffuf threads per process (default 100)")
-    perf.add_argument("--rate", type=int, default=150,
-                      help="rate cap for puredns/ffuf (default 150, 0=unlimited)")
     perf.add_argument("--timeout", type=int, default=5,
                       help="ffuf per-request timeout seconds (default 5)")
     perf.add_argument("--workers", type=int, default=4,
@@ -932,7 +985,7 @@ examples:
     dns.add_argument("--skip-validation", action="store_true",
                      help="skip puredns validation step")
     dns.add_argument("--rate-limit-trusted", type=int, default=0,
-                     help="puredns --rate-limit-trusted value")
+                     help="puredns --rate-limit-trusted (0 = puredns default 500)")
 
     http = p.add_argument_group("http probing")
     http.add_argument("--https-only", action="store_true",
@@ -1045,7 +1098,6 @@ def main(argv=None) -> int:
     if args.log is None:
         args.log = output.with_suffix(output.suffix + ".log")
 
-    # ---- preflight -------------------------------------------------------
     if args.ffuf_only and args.puredns_only:
         display.line(C.red("[!] --ffuf-only and --puredns-only are mutually exclusive"))
         return 1
@@ -1082,7 +1134,6 @@ def main(argv=None) -> int:
             return 1
         args.resolvers = resolvers
 
-    # ---- paths / state ---------------------------------------------------
     work = output.parent / f".{output.name}.work"
     work.mkdir(parents=True, exist_ok=True)
     paths = {
@@ -1098,7 +1149,6 @@ def main(argv=None) -> int:
     marker1 = work / "stage1.ok"
     marker2 = work / "stage2.ok"
 
-    # ---- dry-run: print commands, exit before any side effects -----------
     if args.dry_run:
         if not args.ffuf_only:
             run_puredns(args, paths, domains, display, log)
@@ -1115,7 +1165,6 @@ def main(argv=None) -> int:
     fp = stage_fingerprint(args.input, args.wordlist, args.resolvers)
     exit_code = 0
 
-    # ---- stage 1: DNS ----------------------------------------------------
     if not args.ffuf_only:
         reuse = (args.resume and marker1.exists()
                  and read_marker(marker1) == fp
@@ -1124,6 +1173,12 @@ def main(argv=None) -> int:
             display.line(C.grey("  [=] reusing stage 1 (DNS) results"))
         else:
             display.line(C.bold("  [1/2] DNS brute-force - puredns"))
+            if args.dns_rate == 0:
+                display.line(C.grey(
+                    "        DNS rate: unlimited (pass --dns-rate N to cap)"))
+            else:
+                display.line(C.grey(
+                    f"        DNS rate: {args.dns_rate} qps"))
             rc = run_puredns(args, paths, domains, display, log)
             if rc != 0:
                 display.line(C.yellow(f"  [!] puredns exited {rc}"))
@@ -1133,7 +1188,6 @@ def main(argv=None) -> int:
             elif rc != 0:
                 exit_code = 2
 
-    # ---- collect resolved hosts -----------------------------------------
     if args.ffuf_only:
         resolved_hosts = []
     else:
@@ -1148,7 +1202,6 @@ def main(argv=None) -> int:
             if exit_code == 0:
                 exit_code = 2
 
-    # ---- stage 2: HTTP ---------------------------------------------------
     ffuf_rows = []
     if not args.puredns_only and not args.ffuf_only:
         if not resolved_hosts:
@@ -1173,7 +1226,6 @@ def main(argv=None) -> int:
         pairs = run_ffuf_fallback(domains, args, paths, display, log)
         ffuf_rows = [r for _, r in pairs]
 
-    # ---- rows / output ---------------------------------------------------
     resolved_set = set(resolved_hosts or [])
     for r in ffuf_rows:
         h = urlsplit(r.get("url", "")).hostname
@@ -1217,3 +1269,4 @@ if __name__ == "__main__":
         sys.exit(130)
     except BrokenPipeError:
         sys.exit(1)
+
