@@ -15,9 +15,9 @@ GO_VERSION="${GO_VERSION:-1.22.5}"
 GO_MIN_MAJOR=1
 GO_MIN_MINOR=21
 
-FFUF_VERSION="${FFUF_VERSION:-v2.1.0}"          # pin for reproducibility
-PUREDNS_VERSION="${PUREDNS_VERSION:-v2.1.6}"    # pin for reproducibility
-MASSDNS_REF="${MASSDNS_REF:-master}"            # upstream has no release tags
+FFUF_VERSION="${FFUF_VERSION:-v2.1.0}"
+PUREDNS_VERSION="${PUREDNS_VERSION:-v2.1.6}"
+MASSDNS_REF="${MASSDNS_REF:-master}"
 
 
 # ---------------------------------------------------------------- colours
@@ -76,7 +76,6 @@ banner() {
   local hline
   hline=$(printf "%0.s${H}" $(seq 1 "$W"))
 
-  # box
   printf "  ${C}%s%s%s${N}\n" "$TL" "$hline" "$TR"
 
   local tlen=${#title}
@@ -87,21 +86,19 @@ banner() {
 
   printf "  ${C}%s%s%s${N}\n" "$BL" "$hline" "$BR"
 
-  # centred line 1 (cyan)
-  local len=${#l1}
-  lpad=$(( (W - len) / 2 )); rpad=$(( W - len - lpad ))
-  printf "  %*s${C}%s${N}%*s\n" "$lpad" "" "$l1" "$rpad" ""
+  local len lpad rpad2
+  len=${#l1}
+  lpad=$(( (W - len) / 2 )); rpad2=$(( W - len - lpad ))
+  printf "  %*s${C}%s${N}%*s\n" "$lpad" "" "$l1" "$rpad2" ""
 
-  # centred line 2 (magenta | grey | yellow)
   len=${#l2}
-  lpad=$(( (W - len) / 2 )); rpad=$(( W - len - lpad ))
+  lpad=$(( (W - len) / 2 )); rpad2=$(( W - len - lpad ))
   printf "  %*s${M}%s${N}${GR}%s${N}${Y}%s${N}%*s\n" \
-    "$lpad" "" "$a" "$sep" "$b" "$rpad" ""
+    "$lpad" "" "$a" "$sep" "$b" "$rpad2" ""
 
-  # centred line 3 (grey)
   len=${#l3}
-  lpad=$(( (W - len) / 2 )); rpad=$(( W - len - lpad ))
-  printf "  %*s${GR}%s${N}%*s\n\n" "$lpad" "" "$l3" "$rpad" ""
+  lpad=$(( (W - len) / 2 )); rpad2=$(( W - len - lpad ))
+  printf "  %*s${GR}%s${N}%*s\n\n" "$lpad" "" "$l3" "$rpad2" ""
 }
 
 banner
@@ -157,7 +154,7 @@ install_pkg() {
     apt)    $SUDO apt-get update -qq && $SUDO apt-get install -y "$pkg";;
     dnf)    $SUDO dnf install -y "$pkg";;
     pacman) $SUDO pacman -S --noconfirm "$pkg";;
-    brew)   brew install "$pkg";;          # brew must NOT be run with sudo
+    brew)   brew install "$pkg";;
     *)      return 1;;
   esac
 }
@@ -324,14 +321,13 @@ fi
 ensure_path_in "$FUZZY_BIN"
 
 
-# ---- massdns capabilities (rootless raw sockets) -------------------------
+# ---- massdns capabilities ------------------------------------------------
 if [ -f "$FUZZY_BIN/massdns" ]; then
   if [ "$OS" = "darwin" ]; then
     warn "macOS: massdns needs sudo or root to run (setcap not available)"
   elif [ "$(id -u)" -eq 0 ]; then
     ok "massdns capabilities - running as root"
   else
-    # ensure setcap exists
     if ! have setcap; then
       say "installing setcap (libcap)"
       case "$PM" in
@@ -372,25 +368,74 @@ ensure_path_in "$FUZZY_BIN"
 
 
 # ---------------------------------------------------------------- resolvers
+# v1.0.1 fix: normalize before validating (handles CRLF, BOM, trailing
+# whitespace, IPv6-with-brackets, and format drift on the upstream list).
 
 RESOLVER_FILE="$FUZZY_CONFIG/resolvers.txt"
-if [ -s "$RESOLVER_FILE" ] && \
-   grep -qE '^[0-9a-fA-F:.]+:[0-9]+$' "$RESOLVER_FILE" 2>/dev/null; then
-  ok "resolvers already present: $RESOLVER_FILE ($(wc -l < "$RESOLVER_FILE") lines)"
-else
+
+normalize_resolvers() {
+  local f="$1" tmp
+  tmp=$(mktemp)
+  tr -d '\r' < "$f" \
+    | sed 's/^[[:space:]]*//;s/[[:space:]]*$//' \
+    | grep -vE '^[[:space:]]*(#|$)' > "$tmp" || true
+  mv "$tmp" "$f"
+}
+
+count_strict_resolvers() {
+  local f="$1" n
+  n=$(grep -cE \
+        '^([0-9]{1,3}\.){3}[0-9]{1,3}:[0-9]+$|^\[?[0-9a-fA-F:]+\]?:[0-9]+$' \
+        "$f" 2>/dev/null || true)
+  echo "${n:-0}"
+}
+
+download_resolvers() {
   say "downloading resolvers"
+  local rtmp bytes lines strict total
   rtmp=$(mktemp)
   if ! curl -fsSL "$RESOLVER_URL" -o "$rtmp"; then
     err "resolver download failed"
-    rm -f "$rtmp"; exit 1
+    rm -f "$rtmp"; return 1
   fi
-  valid_count=$(grep -cE '^[0-9a-fA-F:.]+:[0-9]+$' "$rtmp" 2>/dev/null || true)
-  if [ "${valid_count:-0}" -lt 10 ]; then
-    err "downloaded resolver file looks invalid (${valid_count:-0} valid entries)"
-    rm -f "$rtmp"; exit 1
+  bytes=$(wc -c < "$rtmp")
+  lines=$(wc -l < "$rtmp" 2>/dev/null || echo 0)
+  say "  fetched ${bytes} bytes, ${lines} lines"
+  normalize_resolvers "$rtmp"
+
+  total=$(wc -l < "$rtmp" 2>/dev/null || echo 0)
+  strict=$(count_strict_resolvers "$rtmp")
+
+  if [ "$total" -lt 10 ]; then
+    err "downloaded resolver file looks unusable (${total} non-comment lines)"
+    err "  raw size:  ${bytes} bytes, ${lines} lines"
+    err "  first 3 lines:"
+    head -3 "$rtmp" 2>/dev/null | sed 's/^/    /' >&2
+    rm -f "$rtmp"; return 1
   fi
+
+  if [ "$strict" -lt 10 ]; then
+    warn "resolver file has ${strict} strict IP:port lines out of ${total} total"
+    warn "using anyway - some entries may be rejected by puredns"
+  fi
+
   mv "$rtmp" "$RESOLVER_FILE"
   ok "resolvers: $RESOLVER_FILE ($(wc -l < "$RESOLVER_FILE") lines)"
+  return 0
+}
+
+if [ -s "$RESOLVER_FILE" ]; then
+  normalize_resolvers "$RESOLVER_FILE"
+  existing=$(wc -l < "$RESOLVER_FILE" 2>/dev/null || echo 0)
+  if [ "$existing" -ge 10 ]; then
+    ok "resolvers already present: $RESOLVER_FILE (${existing} lines)"
+  else
+    warn "existing resolver file is too small (${existing} lines), re-downloading"
+    rm -f "$RESOLVER_FILE"
+    download_resolvers || exit 1
+  fi
+else
+  download_resolvers || exit 1
 fi
 
 
@@ -403,7 +448,6 @@ SRC_PY="$SCRIPT_DIR/fuzzy.py"
 say "installing fuzzy CLI"
 install -m 755 "$SRC_PY" "$FUZZY_HOME/fuzzy.py"
 
-# warn if a real (non-symlink) 'fuzzy' already exists at $FUZZY_BIN
 if [ -e "$FUZZY_BIN/fuzzy" ] && [ ! -L "$FUZZY_BIN/fuzzy" ]; then
   warn "$FUZZY_BIN/fuzzy exists and is not a symlink - backing up"
   mv "$FUZZY_BIN/fuzzy" "$FUZZY_BIN/fuzzy.bak.$(date +%s)"
